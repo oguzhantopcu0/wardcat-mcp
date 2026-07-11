@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# wardcat is pulled from git (not on PyPI yet), which is a PEP 508 direct
+# reference — hatchling needs this opt-in to allow it.
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project]
+name = "wardcat-mcp"
+version = "0.1.0"
+description = "MCP server exposing wardcat's on-prem PII detection/anonymization as agent tools"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Oğuzhan Topçu", email = "oguzhantopcu000@gmail.com" }]
+keywords = ["mcp", "pii", "privacy", "anonymization", "llm", "guardrail", "wardcat", "on-prem"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+
+dependencies = [
+    # wardcat is not on PyPI yet — pull it from source. Switch to "wardcat>=1.0"
+    # once it is published.
+    "wardcat @ git+https://github.com/oguzhantopcu0/wardcat.git",
+    "mcp>=1.2.0",
+]
+
+[project.optional-dependencies]
+# Enable the SpaCy NER layer (PERSON/ORG/ADDRESS) inside the server.
+ner = ["wardcat[ner] @ git+https://github.com/oguzhantopcu0/wardcat.git"]
+
+[project.scripts]
+wardcat-mcp = "wardcat_mcp.server:main"
+
+[project.urls]
+"Homepage" = "https://github.com/oguzhantopcu0/wardcat-mcp"
+"wardcat" = "https://github.com/oguzhantopcu0/wardcat"
+
+[dependency-groups]
+dev = ["ruff>=0.15", "mypy>=1.11"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
