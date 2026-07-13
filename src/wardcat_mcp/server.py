@@ -10,18 +10,46 @@ Configure with environment variables:
     WARDCAT_ENTITIES     comma-separated entity types to enable
                          (default: a broad structural + name set)
     WARDCAT_ACTION       warn | hash | redact | mask   (default: redact)
+    WARDCAT_SPACY_MODEL  if set, enables the SpaCy NER layer with this model
     WARDCAT_LLM_MODEL    if set, enables the LLM layer via Ollama (e.g. llama3.2:3b)
     WARDCAT_LLM_BASE_URL Ollama base URL (default: http://localhost:11434)
 """
 
 from __future__ import annotations
 
+import logging
 import os
+from typing import TypedDict
 
 from mcp.server.fastmcp import FastMCP
-from wardcat import Backend, Wardcat, all_entities
+from mcp.types import ToolAnnotations
+from wardcat import (
+    Backend,
+    ConfigError,
+    ScanResult,
+    Wardcat,
+    all_entities,
+    registered_actions,
+)
+
+# wardcat deliberately splits detection from anonymization; we reuse that split
+# so redact(text, action) can re-apply a per-call action to already-detected
+# spans without re-detecting (no model reload) or mutating the shared guard.
+# NOTE: these live outside wardcat's public __all__; the dependency is pinned to
+# a single minor (wardcat>=1.0.1,<1.2) until a public re-anonymization API lands.
+from wardcat.core.anonymizer import Anonymizer
+from wardcat.core.models import Violation
+from wardcat.detectors.base import DetectedSpan
+
+logger = logging.getLogger("wardcat_mcp")
 
 mcp = FastMCP("wardcat")
+
+# The salt and default action are fixed at startup from the environment; the
+# redact tool can still override the action per call.
+_SALT = os.environ.get("WARDCAT_SALT", "")
+_DEFAULT_ACTION = os.environ.get("WARDCAT_ACTION", "redact")
+_VALID_ACTIONS = registered_actions()  # {"warn", "hash", "redact", "mask"}
 
 # Structural, regex-detectable PII — always safe to enable (deterministic, no model).
 _STRUCTURAL_ENTITIES = [
@@ -33,11 +61,59 @@ _STRUCTURAL_ENTITIES = [
 _NAME_ENTITIES = ["PERSON", "ORG", "ADDRESS"]
 
 
+# --- Structured tool output (TypedDicts give the tools an outputSchema) --------
+
+
+class ViolationSummary(TypedDict):
+    """A single detected entity — its type, the action applied, and confidence.
+
+    Deliberately PII-free: never carries the raw matched value.
+    """
+
+    type: str
+    action: str
+    confidence: float
+
+
+class ScanOutput(TypedDict):
+    """Result of `scan`: sanitized text plus a PII-free summary."""
+
+    sanitized_text: str
+    is_clean: bool
+    violation_count: int
+    violations: list[ViolationSummary]
+    warnings: list[str]
+
+
+class RedactOutput(ScanOutput):
+    """Result of `redact`: like ScanOutput, plus the action that was applied."""
+
+    action: str
+
+
+class ServerInfo(TypedDict):
+    """What this server can detect and how it will anonymize by default."""
+
+    enabled_entities: list[str]
+    default_action: str
+    valid_actions: list[str]
+    ner_enabled: bool
+    llm_enabled: bool
+
+
+def _ner_enabled() -> bool:
+    return bool(os.environ.get("WARDCAT_SPACY_MODEL"))
+
+
+def _llm_enabled() -> bool:
+    return bool(os.environ.get("WARDCAT_LLM_MODEL"))
+
+
 def _build_guard() -> Wardcat:
     """Build one shared guard from the environment (configured once at startup)."""
-    action = os.environ.get("WARDCAT_ACTION", "redact")
+    action = _DEFAULT_ACTION
 
-    guard = Wardcat(salt=os.environ.get("WARDCAT_SALT", ""))
+    guard = Wardcat(salt=_SALT)
 
     # NER (names/orgs/addresses) needs a SpaCy model; enable it only if one is set.
     ner_model = os.environ.get("WARDCAT_SPACY_MODEL")
@@ -63,41 +139,194 @@ def _build_guard() -> Wardcat:
             entities += _NAME_ENTITIES
 
     known = set(all_entities())
+    unknown = [e for e in entities if e not in known]
+    if unknown:
+        # Don't drop silently — a typo in WARDCAT_ENTITIES (e.g. "EMIAL") would
+        # otherwise disable a filter with no signal. Warn to stderr (stdout is
+        # the MCP protocol channel) and carry on with the recognized types.
+        logger.warning(
+            "ignoring unknown WARDCAT_ENTITIES: %s (see wardcat.all_entities() for valid types)",
+            ", ".join(unknown),
+        )
+
+    # The hash action is only pseudonymous with a secret salt; warn once at
+    # startup if hashing is the default but no salt was provided.
+    if action == "hash" and not _SALT:
+        logger.warning(
+            "WARDCAT_ACTION=hash but WARDCAT_SALT is empty — hashes are unsalted "
+            "and reversible by rainbow table. Set WARDCAT_SALT in production."
+        )
+
     guard = guard.add_entities([e for e in entities if e in known], action=action)
     return guard
 
 
-guard = _build_guard()
+# Built lazily so importing this module never triggers SpaCy model loading /
+# auto-download; the guard is created on the first tool call.
+_guard: Wardcat | None = None
 
 
-@mcp.tool()
-async def scan(text: str) -> dict:
+def _get_guard() -> Wardcat:
+    global _guard
+    if _guard is None:
+        _guard = _build_guard()
+    return _guard
+
+
+def _salt_warnings(action: str) -> list[str]:
+    """A per-call warning when `hash` is used without a salt (unsalted → reversible)."""
+    if action == "hash" and not _SALT:
+        return [
+            "hash action used without a salt (WARDCAT_SALT is empty): the "
+            "pseudonyms are unsalted and reversible by rainbow table."
+        ]
+    return []
+
+
+def _validate_entities(entities: list[str] | None) -> set[str] | None:
+    """Normalize a per-call ``entities`` subset, or ``None`` for "all enabled".
+
+    Anything requested that the server didn't enable at startup is rejected
+    loudly rather than silently narrowing to nothing — the same no-silent-drop
+    principle applied to the startup config.
+    """
+    if not entities:
+        return None
+    requested = {e.strip() for e in entities if e.strip()}
+    enabled = _get_guard().enabled_entities()
+    unknown = requested - enabled
+    if unknown:
+        raise ValueError(
+            f"entities {sorted(unknown)} are not enabled on this server; enabled: {sorted(enabled)}"
+        )
+    return requested
+
+
+def _reanonymize(
+    result: ScanResult, action: str, keep: set[str] | None = None
+) -> tuple[str, list[Violation]]:
+    """Re-apply ``action`` to an already-detected result, without re-detecting.
+
+    ``scan_async`` already found and anonymized the spans with the guard's
+    configured action; here we reuse those spans and only re-run the cheap, pure
+    anonymization step under a different action. When ``keep`` is given, only
+    those entity types are anonymized (the rest are left as-is in the output).
+    Because nothing shared is mutated and no model is touched, this stays
+    concurrency-safe.
+    """
+    violations = result.violations
+    if keep is not None:
+        violations = [v for v in violations if v.entity_type in keep]
+    spans = [
+        DetectedSpan(v.entity_type, v.original, v.start, v.end, v.confidence) for v in violations
+    ]
+    config = {v.entity_type: {"action": action} for v in violations}
+    return Anonymizer(config, salt=_SALT).apply(result.original_text, spans)
+
+
+def _summarize(violations: list[Violation]) -> list[ViolationSummary]:
+    return [
+        {"type": v.entity_type, "action": v.action, "confidence": v.confidence} for v in violations
+    ]
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Scan for PII", readOnlyHint=True))
+async def scan(text: str, entities: list[str] | None = None) -> ScanOutput:
     """Detect PII in `text` and return the sanitized text plus a PII-free summary.
 
-    The raw sensitive values are never returned — only the entity types, the
-    action applied, and the sanitized text — so the tool output is safe to log.
+    The `violations` summary never contains raw sensitive values — only entity
+    types, the action applied, and confidence — so it is always safe to log.
+    `sanitized_text` echoes the original text only when the server's action is
+    `warn` (which reports without altering); for `redact`/`mask`/`hash` the
+    sensitive values are removed.
+
+    Pass `entities` to narrow this call to a subset of the server's enabled
+    types (e.g. `["EMAIL", "IBAN"]`); omit it to apply every enabled filter.
+    Requesting a type the server didn't enable is an error.
     """
-    result = await guard.scan_async(text)
+    keep = _validate_entities(entities)
+    result = await _get_guard().scan_async(text)
+    if keep is None:
+        sanitized, violations = result.sanitized_text, result.violations
+    else:
+        sanitized, violations = _reanonymize(result, _DEFAULT_ACTION, keep)
     return {
-        "sanitized_text": result.sanitized_text,
-        "is_clean": result.is_clean,
-        "violation_count": len(result.violations),
-        "violations": [
-            {"type": v.entity_type, "action": v.action, "confidence": v.confidence}
-            for v in result.violations
-        ],
-        "warnings": result.warnings,
+        "sanitized_text": sanitized,
+        "is_clean": len(violations) == 0,
+        "violation_count": len(violations),
+        "violations": _summarize(violations),
+        "warnings": list(result.warnings) + _salt_warnings(_DEFAULT_ACTION),
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Redact PII", readOnlyHint=True))
+async def redact(text: str, action: str = "", entities: list[str] | None = None) -> RedactOutput:
+    """Detect PII in `text` and anonymize every match with `action`.
+
+    Unlike `scan`, you pick the action per call: `redact` drops the value
+    (`[EMAIL]`), `mask` keeps a hint (`b***@acme.com`, last-4 of a card), `hash`
+    yields a stable salted pseudonym (`[EMAIL:3245e00b…]`), and `warn` leaves the
+    text untouched but still reports what was found. `action` defaults to the
+    server's WARDCAT_ACTION.
+
+    The `violations` summary never contains raw values; `sanitized_text` still
+    holds the original text under `action="warn"` (which reports only).
+
+    Pass `entities` to anonymize only a subset of the server's enabled types
+    (e.g. `["EMAIL", "IBAN"]`), leaving other detected PII untouched; omit it to
+    anonymize everything. Requesting a type the server didn't enable is an error.
+    """
+    action = action or _DEFAULT_ACTION
+    if action not in _VALID_ACTIONS:
+        raise ValueError(f"unknown action {action!r}; choose one of {sorted(_VALID_ACTIONS)}")
+    keep = _validate_entities(entities)
+    result = await _get_guard().scan_async(text)
+    sanitized_text, violations = _reanonymize(result, action, keep)
+    return {
+        "sanitized_text": sanitized_text,
+        "is_clean": len(violations) == 0,
+        "action": action,
+        "violation_count": len(violations),
+        "violations": _summarize(violations),
+        "warnings": list(result.warnings) + _salt_warnings(action),
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Is this text sensitive?", readOnlyHint=True, openWorldHint=True
+    )
+)
 async def is_sensitive(text: str) -> bool:
     """Return True if `text` contains sensitive information (holistic LLM gate).
 
-    Requires the LLM layer (set WARDCAT_LLM_MODEL). Use it as a guardrail before
-    forwarding text to an external service.
+    Requires the on-prem LLM layer: set WARDCAT_LLM_MODEL (e.g. `llama3.2:3b`).
+    Use it as a guardrail before forwarding text to an external service.
     """
-    return await guard.is_sensitive_async(text)
+    try:
+        return await _get_guard().is_sensitive_async(text)
+    except ConfigError as exc:
+        raise ValueError(
+            "is_sensitive requires the LLM layer, which is not configured. Start "
+            "the server with WARDCAT_LLM_MODEL set (e.g. 'llama3.2:3b'), and "
+            "optionally WARDCAT_LLM_BASE_URL for a non-default Ollama endpoint."
+        ) from exc
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Server capabilities", readOnlyHint=True))
+async def server_info() -> ServerInfo:
+    """Report what this server detects and how it anonymizes by default.
+
+    Lets an agent discover the enabled entity types, the default action, and
+    whether the NER / LLM layers are active — without probing by trial and error.
+    """
+    return {
+        "enabled_entities": sorted(_get_guard().enabled_entities()),
+        "default_action": _DEFAULT_ACTION,
+        "valid_actions": sorted(_VALID_ACTIONS),
+        "ner_enabled": _ner_enabled(),
+        "llm_enabled": _llm_enabled(),
+    }
 
 
 def main() -> None:
