@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TypedDict
+
+# Pydantic (used by FastMCP to build tool output schemas from these TypedDicts)
+# requires typing_extensions.TypedDict on Python < 3.12. typing_extensions ships
+# as a transitive dependency of pydantic/mcp.
+from typing_extensions import TypedDict
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations

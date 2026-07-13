@@ -29,6 +29,9 @@ dependencies = [
     "wardcat>=1.0.1,<1.2",
     # 1.10 is where MCP structured tool output landed.
     "mcp>=1.10,<2",
+    # Pydantic needs typing_extensions.TypedDict for tool output schemas on
+    # Python < 3.12; we import it directly, so declare it (it's transitive anyway).
+    "typing-extensions>=4.0",
 ]
 
 [project.optional-dependencies]
