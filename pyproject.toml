@@ -22,11 +22,9 @@ classifiers = [
 ]
 
 dependencies = [
-    # Pinned to a single wardcat minor: the server uses a few wardcat internals
-    # (Anonymizer / DetectedSpan / Violation) that are not yet public API, so a
-    # 1.2 refactor could break us without a semver signal. Relax to a wider range
-    # once wardcat exposes a public re-anonymization API.
-    "wardcat>=1.0.1,<1.2",
+    # 1.1 adds the public ScanResult.reapply() the server relies on for per-call
+    # actions — no more reaching into wardcat internals, so a normal <2 range is safe.
+    "wardcat>=1.1,<2",
     # 1.10 is where MCP structured tool output landed.
     "mcp>=1.10,<2",
     # Pydantic needs typing_extensions.TypedDict for tool output schemas on
@@ -36,7 +34,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Enable the SpaCy NER layer (PERSON/ORG/ADDRESS) inside the server.
-ner = ["wardcat[ner]>=1.0.1,<1.2"]
+ner = ["wardcat[ner]>=1.1,<2"]
 
 [project.scripts]
 wardcat-mcp = "wardcat_mcp.server:main"

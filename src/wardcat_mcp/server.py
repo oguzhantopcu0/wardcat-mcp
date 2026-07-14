@@ -30,20 +30,11 @@ from mcp.types import ToolAnnotations
 from wardcat import (
     Backend,
     ConfigError,
-    ScanResult,
+    Violation,
     Wardcat,
     all_entities,
     registered_actions,
 )
-
-# wardcat deliberately splits detection from anonymization; we reuse that split
-# so redact(text, action) can re-apply a per-call action to already-detected
-# spans without re-detecting (no model reload) or mutating the shared guard.
-# NOTE: these live outside wardcat's public __all__; the dependency is pinned to
-# a single minor (wardcat>=1.0.1,<1.2) until a public re-anonymization API lands.
-from wardcat.core.anonymizer import Anonymizer
-from wardcat.core.models import Violation
-from wardcat.detectors.base import DetectedSpan
 
 logger = logging.getLogger("wardcat_mcp")
 
@@ -206,28 +197,6 @@ def _validate_entities(entities: list[str] | None) -> set[str] | None:
     return requested
 
 
-def _reanonymize(
-    result: ScanResult, action: str, keep: set[str] | None = None
-) -> tuple[str, list[Violation]]:
-    """Re-apply ``action`` to an already-detected result, without re-detecting.
-
-    ``scan_async`` already found and anonymized the spans with the guard's
-    configured action; here we reuse those spans and only re-run the cheap, pure
-    anonymization step under a different action. When ``keep`` is given, only
-    those entity types are anonymized (the rest are left as-is in the output).
-    Because nothing shared is mutated and no model is touched, this stays
-    concurrency-safe.
-    """
-    violations = result.violations
-    if keep is not None:
-        violations = [v for v in violations if v.entity_type in keep]
-    spans = [
-        DetectedSpan(v.entity_type, v.original, v.start, v.end, v.confidence) for v in violations
-    ]
-    config = {v.entity_type: {"action": action} for v in violations}
-    return Anonymizer(config, salt=_SALT).apply(result.original_text, spans)
-
-
 def _summarize(violations: list[Violation]) -> list[ViolationSummary]:
     return [
         {"type": v.entity_type, "action": v.action, "confidence": v.confidence} for v in violations
@@ -250,10 +219,10 @@ async def scan(text: str, entities: list[str] | None = None) -> ScanOutput:
     """
     keep = _validate_entities(entities)
     result = await _get_guard().scan_async(text)
-    if keep is None:
-        sanitized, violations = result.sanitized_text, result.violations
-    else:
-        sanitized, violations = _reanonymize(result, _DEFAULT_ACTION, keep)
+    if keep is not None:
+        # Re-anonymize the detected spans, keeping only the requested subset.
+        result = result.reapply(_DEFAULT_ACTION, entities=keep)
+    sanitized, violations = result.sanitized_text, result.violations
     return {
         "sanitized_text": sanitized,
         "is_clean": len(violations) == 0,
@@ -285,13 +254,14 @@ async def redact(text: str, action: str = "", entities: list[str] | None = None)
         raise ValueError(f"unknown action {action!r}; choose one of {sorted(_VALID_ACTIONS)}")
     keep = _validate_entities(entities)
     result = await _get_guard().scan_async(text)
-    sanitized_text, violations = _reanonymize(result, action, keep)
+    # One detection, re-anonymized under the requested action (and optional subset).
+    result = result.reapply(action, entities=keep)
     return {
-        "sanitized_text": sanitized_text,
-        "is_clean": len(violations) == 0,
+        "sanitized_text": result.sanitized_text,
+        "is_clean": result.is_clean,
         "action": action,
-        "violation_count": len(violations),
-        "violations": _summarize(violations),
+        "violation_count": len(result.violations),
+        "violations": _summarize(result.violations),
         "warnings": list(result.warnings) + _salt_warnings(action),
     }
 
