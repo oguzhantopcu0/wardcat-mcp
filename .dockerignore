@@ -1,0 +1,13 @@
+# Keep the build context minimal and reproducible.
+.git
+.github
+.idea
+.venv
+tests
+**/__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+uv.lock
+CHANGELOG.md

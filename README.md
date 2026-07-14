@@ -45,6 +45,20 @@ uv run wardcat-mcp
 uv run --extra ner wardcat-mcp
 ```
 
+### Docker
+
+The server talks over stdio, so run the container interactively (`-i`):
+
+```bash
+docker build -t wardcat-mcp .
+docker run -i --rm -e WARDCAT_SALT=your-secret wardcat-mcp
+# with the SpaCy NER layer:
+docker build --build-arg EXTRAS='[ner]' -t wardcat-mcp:ner .
+```
+
+In an MCP client, point `command` at `docker` with `args` `["run", "-i", "--rm",
+"-e", "WARDCAT_SALT=your-secret", "wardcat-mcp"]`.
+
 ## Add it to an MCP client
 
 Claude Desktop (`claude_desktop_config.json`), Cursor, Cline, Zed, etc.:

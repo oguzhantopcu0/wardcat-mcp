@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dockerfile** (+ `.dockerignore`) for running the stdio server in a container:
+  `docker run -i --rm -e WARDCAT_SALT=... wardcat-mcp`. Multi-stage, non-root,
+  optional SpaCy NER via `--build-arg EXTRAS='[ner]'`. README documents the flow.
+
 ## [0.1.0] — 2026-07-14
 
 First tagged version — an MCP server wrapping the
